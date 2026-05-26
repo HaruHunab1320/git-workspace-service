@@ -19,12 +19,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/HaruHunab1320/parallax",
-    "directory": "packages/git-workspace-service"
+    "url": "https://github.com/HaruHunab1320/git-workspace-service.git"
   },
-  "homepage": "https://github.com/HaruHunab1320/parallax/tree/main/packages/git-workspace-service#readme",
+  "homepage": "https://github.com/HaruHunab1320/git-workspace-service#readme",
   "bugs": {
-    "url": "https://github.com/HaruHunab1320/parallax/issues"
+    "url": "https://github.com/HaruHunab1320/git-workspace-service/issues"
   },
   "scripts": {
     "build": "tsup",
