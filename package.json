@@ -1,6 +1,6 @@
 {
   "name": "git-workspace-service",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Git workspace provisioning and credential management service with OAuth device flow authentication",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -35,7 +35,8 @@
     "demo:workflow": "tsx demo/full-workflow.ts",
     "demo:oauth": "tsx demo/oauth-demo.ts",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "pnpm run build"
   },
   "keywords": [
     "git",

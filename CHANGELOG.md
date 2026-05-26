@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.6 - 2026-05-26
+
+### Changed
+- Repository extracted from the parallax monorepo into its own standalone repo at `github.com/HaruHunab1320/git-workspace-service`. Package metadata (`repository`, `homepage`, `bugs`) updated accordingly. No source code changes.
+
 ## 0.4.5 - 2026-03-30
 
 ### Fixed
