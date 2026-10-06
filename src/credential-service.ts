@@ -24,6 +24,7 @@ import type {
   GitProviderAdapter,
   OAuthToken,
 } from './types';
+import { redactSecrets } from './utils/git-security';
 
 export interface CredentialServiceLogger {
   info(data: Record<string, unknown>, message: string): void;
@@ -155,7 +156,7 @@ export class CredentialService {
     this.log(
       'info',
       {
-        repo: request.repo,
+        repo: redactSecrets(request.repo),
         provider,
         access: request.access,
         executionId: request.context.executionId,
@@ -181,7 +182,7 @@ export class CredentialService {
       );
       this.log(
         'info',
-        { repo: request.repo, type: request.userProvided.type },
+        { repo: redactSecrets(request.repo), type: request.userProvided.type },
         'Using user-provided credentials'
       );
     }
@@ -204,7 +205,7 @@ export class CredentialService {
         } catch (error) {
           this.log(
             'warn',
-            { repo: request.repo, provider, error },
+            { repo: redactSecrets(request.repo), provider, error },
             'Failed to get provider credentials'
           );
         }
@@ -225,14 +226,14 @@ export class CredentialService {
       if (request.optional) {
         this.log(
           'info',
-          { repo: request.repo },
+          { repo: redactSecrets(request.repo) },
           'No credentials available (optional request, returning null)'
         );
         return null;
       }
 
       throw new Error(
-        `No credentials available for repository: ${request.repo}. ` +
+        `No credentials available for repository: ${redactSecrets(request.repo)}. ` +
           (this.oauthConfig
             ? 'OAuth device flow failed or was cancelled.'
             : 'Configure OAuth to enable interactive authentication.')
@@ -278,7 +279,7 @@ export class CredentialService {
       'info',
       {
         grantId: grant.id,
-        repo: request.repo,
+        repo: redactSecrets(request.repo),
         expiresAt: credential.expiresAt,
         persisted: !!this.grantStore,
       },
@@ -596,7 +597,7 @@ export class CredentialService {
 
     this.log(
       'info',
-      { repo: request.repo },
+      { repo: redactSecrets(request.repo) },
       'Starting OAuth device flow for authentication'
     );
 

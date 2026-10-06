@@ -1,6 +1,6 @@
 {
   "name": "git-workspace-service",
-  "version": "0.4.6",
+  "version": "0.5.0",
   "description": "Git workspace provisioning and credential management service with OAuth device flow authentication",
   "type": "module",
   "main": "./dist/index.cjs",

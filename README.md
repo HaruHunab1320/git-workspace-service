@@ -6,7 +6,7 @@ Git workspace provisioning and credential management service. Handles cloning re
 
 - **Workspace provisioning** - Clone repos, create branches, configure git
 - **Git Worktrees** - Fast parallel workspaces with shared .git directory
-- **Credential management** - Secure credential handling with TTL and revocation
+- **Credential management** - Secure credential handling with TTL and revocation; tokens are never stored in workspaces (see [Security](#security))
 - **Multiple providers** - Support for GitHub, GitLab, Bitbucket, Azure DevOps
 - **GitHub App support** - First-class GitHub App authentication
 - **OAuth Device Flow** - Interactive authentication for CLI/agents (RFC 8628)
@@ -57,6 +57,9 @@ credentialService.registerProvider(githubProvider);
 const workspaceService = new WorkspaceService({
   config: {
     baseDir: '/tmp/workspaces',
+    // Optional: where single-use credential helpers live (must be outside
+    // baseDir, ideally unreadable by agents). Defaults to os.tmpdir().
+    credentialHelperDir: '/var/run/my-service/git-credentials',
   },
   credentialService,
 });
@@ -350,6 +353,39 @@ console.log(workspace.branch.name); // 'test/claude-nonce-abc123'
 
 When `branchName` is set, `isManagedBranch()` may return `false` for the resulting branch — this is expected since custom names intentionally bypass the naming convention. The branch is still created from `baseBranch` and works with both clone and worktree strategies.
 
+## Security
+
+Workspaces are designed to be handed to untrusted code, such as an AI coding agent. **No credential is ever readable from inside a workspace.**
+
+### How credentials are supplied
+
+- **Clone over a plain URL.** Repositories are cloned from `https://host/owner/repo.git`, with no token in the URL. So `.git/config`'s `origin` never contains a credential.
+- **One helper per command, outside the workspace.** For every authenticated git command (clone, fetch, push), the service creates a private directory (mode `0700`, from `mkdtemp`) under `config.credentialHelperDir`, which defaults to `os.tmpdir()` and must be outside `baseDir`. The directory holds the token (`0600`) and a small `sh` credential helper. The helper is passed to git with top-level `git -c credential.helper=...` options, which git never writes to any config file. The directory is deleted when the command finishes, including when it fails, and on `cleanup()`.
+- **Nothing in the workspace points at the token.** After provisioning, the workspace and its `.git/config` contain no token, no credential helper and no helper path. The working tree is untouched: unlike earlier versions, there's no `.git-workspace/` directory and no `.gitignore` edit.
+- **No token in process listings.** The token is never a command-line argument or an environment variable. Only the helper's path appears in `git`'s arguments, and that file is removed straight after the command.
+- **The helper is scoped to the repository host.** The helper only answers `get` requests for `https` and the repository's exact host. Before the service's own helper is added, any other credential helper (system, global or repository-level) is reset, so no other helper sees or stores the token.
+
+### Running authenticated commands in agent-controlled repositories
+
+`push()`, `fetch()`, `finalize({ push: true })` and the fetch done when adding a worktree all run inside a repository the agent may have modified. Before using the token, the service takes these precautions:
+
+- It refuses to run if the repository's own (local or worktree) config sets `credential.*`, `url.*` (`insteadOf` rewrites), `http.*` (proxies, TLS settings, extra headers), `include.*`/`includeIf.*`, `protocol.*`, `core.sshCommand`, `core.askPass`, `core.gitProxy` or `remote.*.{proxy,pushurl,vcs}`.
+- It refuses to run if `origin`'s fetch or push URL no longer matches the URL the workspace was cloned from.
+- It disables hooks (`core.hooksPath`) and `core.fsmonitor` for the command, so no repository-controlled code runs while the helper exists.
+
+### Input validation and redaction
+
+- Every git command runs through `execFile` with an argument array. Nothing is interpolated into a shell.
+- Branch and base-branch names, including a custom `branchName`, are validated with `git check-ref-format` rules plus a strict character allow-list (`A-Z a-z 0-9 . _ / + @ -`, with no leading `-`). Invalid names are rejected before anything touches disk.
+- Repository URLs must be `https://`, SSH (`git@host:owner/repo`, `ssh://...`), `host/owner/repo` or GitHub `owner/repo` shorthand. URLs with embedded credentials (`https://user:token@...`), `http://`, `file://`, `ext::` and similar are rejected.
+- Error messages, events, progress messages and logs are passed through `redactSecrets()`. This strips the workspace token, URL userinfo, well-known token formats (`ghp_…`, `github_pat_…`, `glpat-…`) and `Authorization` headers.
+
+### Consequences for callers
+
+- **Agents can't push or fetch private repositories on their own.** Inside the workspace, `git push` has no credentials, unless the host provides ambient ones such as an SSH agent or a system credential helper. Push through the service instead: use `workspaceService.push(id)`, `workspaceService.fetch(id, ['main'])` or `finalize({ push: true })`.
+- **Same-user processes can still reach the helper while it exists.** The helper directory is private to the service's OS user. A process running as that same user could still read it during the brief window when a command is running. For strong isolation, run agents as a different OS user or in a sandbox that can't read `credentialHelperDir`, `os.tmpdir()` or the service's environment.
+- **Tokens aren't refreshed automatically.** The token captured at provisioning is used for later pushes, so a short-lived token (such as a GitHub App installation token, which lasts 1 hour) may expire before `finalize()`.
+
 ## API Reference
 
 ### WorkspaceService
@@ -366,6 +402,12 @@ class WorkspaceService {
 
   // Finalize workspace (push, create PR, cleanup)
   finalize(workspaceId: string, options: WorkspaceFinalization): Promise<PullRequestInfo | void>;
+
+  // Push the workspace branch to origin with the workspace's credential
+  push(workspaceId: string, options?: { force?: boolean; setUpstream?: boolean }): Promise<void>;
+
+  // Fetch from origin with the workspace's credential
+  fetch(workspaceId: string, refs?: string[]): Promise<void>;
 
   // Get workspace by ID
   get(workspaceId: string): Workspace | null;

@@ -2,6 +2,7 @@
  * Workspace Service Tests
  */
 
+import * as childProcess from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -15,28 +16,38 @@ import type {
 } from '../src/types';
 import { WorkspaceService } from '../src/workspace-service';
 
-// Mock child_process
+// Mock child_process. All git commands go through execFile with an argument
+// array; exec is only used for completion hook commands.
 vi.mock('child_process', () => ({
-  exec: vi.fn((cmd, opts, cb) => {
+  exec: vi.fn((_cmd, opts, cb) => {
     if (typeof opts === 'function') {
       cb = opts;
     }
+    cb?.(null, '', '');
+  }),
+  execFile: vi.fn((_file: string, args: string[], _opts, cb) => {
+    const isClone = args.includes('clone');
+    const hasCredentialHelper = args.some((a) =>
+      a.startsWith('credential.helper=!')
+    );
 
     // Simulate authentication failure for unauthenticated clone attempts
-    // (clones that don't have x-access-token in the URL)
-    if (cmd.includes('git clone') && !cmd.includes('x-access-token:')) {
-      if (cb) {
-        const error = new Error('Authentication failed for repository');
-        cb(error, { stdout: '', stderr: 'fatal: Authentication failed' });
-      }
-      return { stdout: '', stderr: 'fatal: Authentication failed' };
+    if (isClone && !hasCredentialHelper) {
+      const error = Object.assign(new Error('Command failed: git clone'), {
+        code: 128,
+      });
+      cb(error, '', 'fatal: Authentication failed');
+      return;
     }
 
-    // Simulate successful git commands for authenticated operations
-    if (cb) {
-      cb(null, { stdout: '', stderr: '' });
+    // The service checks origin before authenticated fetch/push
+    if (args.includes('get-url')) {
+      cb(null, 'https://github.com/owner/repo.git\n', '');
+      return;
     }
-    return { stdout: '', stderr: '' };
+
+    // Simulate successful git commands for everything else
+    cb(null, '', '');
   }),
 }));
 
@@ -130,6 +141,66 @@ describe('WorkspaceService', () => {
       expect(workspace.branch.name).toBe('parallax/exec-123/engineer');
       expect(workspace.status).toBe('ready');
       expect(workspace.credential).toBeDefined();
+    });
+
+    it('runs git without a shell and never puts the token in arguments', async () => {
+      const execFileMock = vi.mocked(childProcess.execFile);
+      execFileMock.mockClear();
+
+      const workspace = await service.provision({
+        repo: 'https://github.com/owner/repo',
+        branchStrategy: 'feature_branch',
+        baseBranch: 'main',
+        execution: { id: 'exec-123', patternName: 'test-pattern' },
+        task: { id: 'task-456', role: 'engineer' },
+      });
+      await service.finalize(workspace.id, {
+        push: true,
+        createPr: false,
+        cleanup: true,
+      });
+
+      const calls = execFileMock.mock.calls.map(
+        (c) => [c[0], c[1] as string[]] as const
+      );
+      expect(calls.length).toBeGreaterThan(0);
+      for (const [file, args] of calls) {
+        expect(file).toBe('git');
+        expect(Array.isArray(args)).toBe(true);
+        expect(args.join(' ')).not.toContain('test-token');
+        expect(args.join(' ')).not.toContain('x-access-token');
+      }
+      expect(vi.mocked(childProcess.exec)).not.toHaveBeenCalled();
+
+      const clone = calls.find(([, a]) => a.includes('clone'))![1];
+      expect(clone.slice(clone.indexOf('clone'))).toEqual([
+        'clone',
+        '--branch=main',
+        '--',
+        'https://github.com/owner/repo.git',
+        '.',
+      ]);
+      // Credentials come from a helper outside the workspace, via -c
+      expect(clone).toContain('credential.helper=');
+      const helperArg = clone.find((a) => a.startsWith('credential.helper=!'))!;
+      expect(helperArg).not.toContain(workspace.path);
+      expect(clone.indexOf('-c')).toBeLessThan(clone.indexOf('clone'));
+
+      const push = calls.find(([, a]) => a.includes('push'))![1];
+      expect(push.slice(push.indexOf('push'))).toEqual([
+        'push',
+        '-u',
+        'origin',
+        'parallax/exec-123/engineer',
+      ]);
+      expect(push).toContain(`core.hooksPath=${os.devNull}`);
+      expect(push.some((a) => a.startsWith('credential.helper=!'))).toBe(true);
+
+      // Nothing configures a credential helper in the workspace itself
+      const configCalls = calls.filter(([, a]) => a[0] === 'config');
+      for (const [, a] of configCalls) {
+        expect(a.join(' ')).not.toMatch(/credential/);
+      }
     });
 
     it('generates branch with slug', async () => {

@@ -1002,6 +1002,18 @@ export interface WorkspaceServiceConfig {
   branchPrefix?: string;
 
   /**
+   * Parent directory for the single-use credential helpers the service
+   * creates while it runs an authenticated git command (clone, fetch, push).
+   * Each helper lives in a private `gws-cred-*` subdirectory (mode 0700) that
+   * is deleted as soon as the command finishes.
+   *
+   * Must be outside `baseDir`. Point it at a directory that agents running in
+   * workspaces cannot read (for example, outside their sandbox).
+   * Default: `os.tmpdir()`.
+   */
+  credentialHelperDir?: string;
+
+  /**
    * GitHub App configuration (optional)
    */
   githubApp?: GitHubAppConfig;

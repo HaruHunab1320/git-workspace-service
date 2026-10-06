@@ -24,13 +24,23 @@ import type {
   WorkspaceStrategy,
 } from './types';
 import { createBranchInfo } from './utils/branch-naming';
+import { cleanupCredentialFiles } from './utils/git-credential-helper';
 import {
-  type CredentialHelperContext,
-  cleanupCredentialFiles,
-  configureCredentialHelper,
-  getGitCredentialConfig,
-} from './utils/git-credential-helper';
+  assertRepoConfigSafe,
+  createEphemeralCredentialHelper,
+  type EphemeralCredentialHelper,
+  hardeningConfigArgs,
+  runGit,
+} from './utils/git-exec';
+import {
+  assertValidRefName,
+  type ParsedRepoUrl,
+  parseRepoUrl,
+  redactSecrets,
+} from './utils/git-security';
 
+// Used only for the caller-configured completion hook command, which is a
+// shell command by design. All git commands go through runGit (execFile).
 const execAsync = promisify(exec);
 
 export interface WorkspaceServiceLogger {
@@ -57,19 +67,43 @@ export interface WorkspaceServiceOptions {
   logger?: WorkspaceServiceLogger;
 }
 
+export interface WorkspacePushOptions {
+  /** Force-push (`--force`). Default: false */
+  force?: boolean;
+  /** Set the upstream tracking branch (`-u`). Default: true */
+  setUpstream?: boolean;
+}
+
 export class WorkspaceService {
   private workspaces: Map<string, Workspace> = new Map();
   private readonly baseDir: string;
   private readonly branchPrefix: string;
+  private readonly credentialHelperDir?: string;
   private readonly credentialService: CredentialService | null;
   private readonly logger?: WorkspaceServiceLogger;
   private readonly eventHandlers: Set<WorkspaceEventHandler> = new Set();
+  /** Credential helpers currently on disk, per workspace (removed on cleanup) */
+  private readonly activeCredentialHelpers: Map<
+    string,
+    Set<EphemeralCredentialHelper>
+  > = new Map();
 
   constructor(options: WorkspaceServiceOptions) {
     this.baseDir = options.config.baseDir;
     this.branchPrefix = options.config.branchPrefix || 'parallax';
     this.credentialService = options.credentialService ?? null;
     this.logger = options.logger;
+
+    if (options.config.credentialHelperDir) {
+      const helperDir = path.resolve(options.config.credentialHelperDir);
+      const base = path.resolve(this.baseDir);
+      if (helperDir === base || helperDir.startsWith(base + path.sep)) {
+        throw new Error(
+          'credentialHelperDir must be outside baseDir, so credentials are never stored inside a workspace'
+        );
+      }
+      this.credentialHelperDir = helperDir;
+    }
   }
 
   /**
@@ -118,6 +152,29 @@ export class WorkspaceService {
         throw new Error('Worktree must be for the same repository as parent');
       }
     }
+
+    // Validate everything that will be passed to git before touching disk
+    parseRepoUrl(config.repo);
+    assertValidRefName(config.baseBranch, 'base branch');
+
+    // Generate branch name (or use caller-provided override)
+    const branchInfo: BranchInfo = config.branchName
+      ? {
+          name: config.branchName,
+          executionId: config.execution.id,
+          baseBranch: config.baseBranch,
+          createdAt: new Date(),
+        }
+      : createBranchInfo(
+          {
+            executionId: config.execution.id,
+            role: config.task.role,
+            slug: config.task.slug,
+            baseBranch: config.baseBranch,
+          },
+          { prefix: this.branchPrefix }
+        );
+    assertValidRefName(branchInfo.name, 'branch');
 
     const workspaceId = randomUUID();
 
@@ -190,24 +247,6 @@ export class WorkspaceService {
         });
       }
     }
-
-    // Generate branch name (or use caller-provided override)
-    const branchInfo: BranchInfo = config.branchName
-      ? {
-          name: config.branchName,
-          executionId: config.execution.id,
-          baseBranch: config.baseBranch,
-          createdAt: new Date(),
-        }
-      : createBranchInfo(
-          {
-            executionId: config.execution.id,
-            role: config.task.role,
-            slug: config.task.slug,
-            baseBranch: config.baseBranch,
-          },
-          { prefix: this.branchPrefix }
-        );
 
     // Create workspace object (credential is optional for public repos)
     const workspace: Workspace = {
@@ -312,10 +351,10 @@ export class WorkspaceService {
       });
 
       return workspace;
-    } catch (error) {
+    } catch (rawError) {
+      const error = this.sanitizeError(rawError, workspace);
       workspace.status = 'error';
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
+      const errorMessage = error.message;
       this.updateProgress(workspace, 'error', errorMessage);
       this.workspaces.set(workspaceId, workspace);
 
@@ -437,7 +476,7 @@ export class WorkspaceService {
 
     try {
       if (options.push) {
-        await this.pushBranch(workspace);
+        await this.pushBranch(workspace, {});
       }
 
       if (options.createPr && options.pr) {
@@ -464,15 +503,62 @@ export class WorkspaceService {
       }
 
       return pr;
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
+    } catch (rawError) {
+      const error = this.sanitizeError(rawError, workspace);
       this.log(
         'error',
-        { workspaceId, error: errorMessage },
+        { workspaceId, error: error.message },
         'Failed to finalize workspace'
       );
       throw error;
+    }
+  }
+
+  /**
+   * Push the workspace branch to `origin`, authenticating with the
+   * workspace's credential.
+   *
+   * Use this instead of running `git push` yourself: workspaces no longer
+   * contain any stored credential, so a plain `git push` inside the workspace
+   * can only use ambient credentials (SSH agent, system credential helpers).
+   */
+  async push(
+    workspaceId: string,
+    options: WorkspacePushOptions = {}
+  ): Promise<void> {
+    const workspace = this.workspaces.get(workspaceId);
+    if (!workspace) {
+      throw new Error(`Workspace not found: ${workspaceId}`);
+    }
+    try {
+      await this.pushBranch(workspace, options);
+    } catch (error) {
+      throw this.sanitizeError(error, workspace);
+    }
+  }
+
+  /**
+   * Fetch from `origin`, authenticating with the workspace's credential.
+   *
+   * @param refs Optional branch names to fetch (validated as ref names).
+   *             Fetches all configured refspecs when omitted.
+   */
+  async fetch(workspaceId: string, refs: string[] = []): Promise<void> {
+    const workspace = this.workspaces.get(workspaceId);
+    if (!workspace) {
+      throw new Error(`Workspace not found: ${workspaceId}`);
+    }
+    for (const ref of refs) {
+      assertValidRefName(ref, 'ref');
+    }
+    try {
+      await this.runAuthenticatedInRepo(workspace, workspace.path, [
+        'fetch',
+        'origin',
+        ...refs,
+      ]);
+    } catch (error) {
+      throw this.sanitizeError(error, workspace);
     }
   }
 
@@ -519,7 +605,10 @@ export class WorkspaceService {
       }
     }
 
-    // Clean up credential files first (securely remove tokens)
+    // Clean up credential files first (securely remove tokens): any
+    // ephemeral helper still on disk for this workspace, plus the legacy
+    // in-workspace `.git-workspace/` directory written by versions < 0.5.0.
+    await this.disposeCredentialHelpers(workspace.id);
     try {
       await cleanupCredentialFiles(workspace.path);
     } catch (error) {
@@ -538,10 +627,12 @@ export class WorkspaceService {
       if (parent) {
         try {
           // Remove worktree using git command from parent
-          await this.execInDir(
-            parent.path,
-            `git worktree remove "${workspace.path}" --force`
-          );
+          await this.git(parent.path, [
+            'worktree',
+            'remove',
+            '--force',
+            path.resolve(workspace.path),
+          ]);
         } catch (error) {
           const errorMessage =
             error instanceof Error ? error.message : String(error);
@@ -639,32 +730,17 @@ export class WorkspaceService {
   private async tryUnauthenticatedClone(
     workspace: Workspace
   ): Promise<{ success: boolean; error?: string }> {
-    // Build HTTPS URL without auth
-    let cloneUrl = workspace.repo;
-
-    // Convert SSH to HTTPS
-    if (cloneUrl.startsWith('git@github.com:')) {
-      cloneUrl = cloneUrl.replace('git@github.com:', 'https://github.com/');
-    }
-
-    // Strip trailing slashes before checking for .git
-    cloneUrl = cloneUrl.replace(/\/+$/, '');
-
-    // Add .git if missing
-    if (!cloneUrl.endsWith('.git')) {
-      cloneUrl = `${cloneUrl}.git`;
-    }
-
-    // Ensure HTTPS
-    if (!cloneUrl.startsWith('https://')) {
-      cloneUrl = `https://${cloneUrl}`;
-    }
+    // Public clones always go over credential-free HTTPS (SSH URLs converted)
+    const repo = parseRepoUrl(workspace.repo);
 
     try {
-      await this.execInDir(
-        workspace.path,
-        `git clone --branch ${workspace.branch.baseBranch} ${cloneUrl} .`
-      );
+      await this.git(workspace.path, [
+        'clone',
+        `--branch=${workspace.branch.baseBranch}`,
+        '--',
+        repo.httpsUrl,
+        '.',
+      ]);
       this.log(
         'info',
         { workspaceId: workspace.id },
@@ -692,26 +768,44 @@ export class WorkspaceService {
     }
   }
 
+  /**
+   * Clone with credentials.
+   *
+   * Token credentials: clones the plain `https://host/owner/repo.git` URL and
+   * supplies the token through a single-use credential helper passed with a
+   * top-level `git -c` option, which git does not write to `.git/config`.
+   *
+   * SSH credentials (empty token): clones the SSH URL as given, relying on
+   * the system SSH agent.
+   */
   private async cloneRepo(workspace: Workspace, token: string): Promise<void> {
-    // For SSH credentials (empty token), use the URL as-is
-    // For token-based auth, build authenticated HTTPS URL
-    const cloneUrl = token
-      ? this.buildAuthenticatedUrl(workspace.repo, token)
-      : workspace.repo;
+    const repo = parseRepoUrl(workspace.repo);
+    const cloneArgs = (url: string) => [
+      'clone',
+      `--branch=${workspace.branch.baseBranch}`,
+      '--',
+      url,
+      '.',
+    ];
 
     // Full clone so agents can merge/rebase with complete history
-    await this.execInDir(
-      workspace.path,
-      `git clone --branch ${workspace.branch.baseBranch} ${cloneUrl} .`
+    if (!token) {
+      await this.git(workspace.path, cloneArgs(repo.sshUrl ?? repo.httpsUrl));
+      return;
+    }
+
+    await this.withCredentialHelper(workspace, repo, token, (authArgs) =>
+      this.git(
+        workspace.path,
+        [...hardeningConfigArgs(), ...authArgs, ...cloneArgs(repo.httpsUrl)],
+        [token]
+      )
     );
   }
 
   private async createBranch(workspace: Workspace): Promise<void> {
     // Create and checkout the new branch
-    await this.execInDir(
-      workspace.path,
-      `git checkout -b ${workspace.branch.name}`
-    );
+    await this.git(workspace.path, ['checkout', '-b', workspace.branch.name]);
   }
 
   private async addWorktreeFromParent(
@@ -720,73 +814,54 @@ export class WorkspaceService {
   ): Promise<void> {
     // Fetch the base branch first to ensure it's up to date
     try {
-      await this.execInDir(
-        parent.path,
-        `git fetch origin ${workspace.branch.baseBranch}`
+      await this.runAuthenticatedInRepo(parent, parent.path, [
+        'fetch',
+        'origin',
+        workspace.branch.baseBranch,
+      ]);
+    } catch (error) {
+      // May fail if already fetched or offline; continue with what we have
+      this.log(
+        'warn',
+        {
+          workspaceId: workspace.id,
+          error: this.sanitizeError(error, parent).message,
+        },
+        'Failed to fetch base branch in parent workspace'
       );
-    } catch {
-      // May fail if already fetched or in shallow clone, continue anyway
     }
 
     // Create the worktree with a new branch based on the base branch
     // Use -b to create the new branch at the same time
-    await this.execInDir(
-      parent.path,
-      `git worktree add -b ${workspace.branch.name} "${workspace.path}" origin/${workspace.branch.baseBranch}`
-    );
+    await this.git(parent.path, [
+      'worktree',
+      'add',
+      '-b',
+      workspace.branch.name,
+      path.resolve(workspace.path),
+      `origin/${workspace.branch.baseBranch}`,
+    ]);
   }
 
   private async configureGit(workspace: Workspace): Promise<void> {
     // Configure git identity
-    await this.execInDir(
-      workspace.path,
-      'git config user.name "Workspace Agent"'
-    );
-    await this.execInDir(
-      workspace.path,
-      'git config user.email "agent@workspace.local"'
-    );
+    await this.git(workspace.path, ['config', 'user.name', 'Workspace Agent']);
+    await this.git(workspace.path, [
+      'config',
+      'user.email',
+      'agent@workspace.local',
+    ]);
 
-    // Skip credential helper if no credentials (public repo) or SSH-based auth (no token)
-    if (!workspace.credential?.token) {
-      this.log(
-        'debug',
-        { workspaceId: workspace.id },
-        workspace.credential
-          ? 'Using SSH authentication, skipping credential helper'
-          : 'No credentials (public repo), skipping credential helper'
-      );
-      return;
-    }
-
-    // Configure credential helper for token-based auth
-    const credentialContext: CredentialHelperContext = {
-      workspaceId: workspace.id,
-      executionId: workspace.branch.executionId,
-      repo: workspace.repo,
-      token: workspace.credential.token,
-      expiresAt: workspace.credential.expiresAt.toISOString(),
-    };
-
-    const helperScriptPath = await configureCredentialHelper(
-      workspace.path,
-      credentialContext
-    );
-
-    // Configure git to use our credential helper
-    const configCommands = getGitCredentialConfig(helperScriptPath);
-    for (const cmd of configCommands) {
-      await this.execInDir(workspace.path, cmd);
-    }
-
-    this.log(
-      'debug',
-      { workspaceId: workspace.id, helperPath: helperScriptPath },
-      'Git credential helper configured'
-    );
+    // Credentials are deliberately NOT configured in the workspace: no token,
+    // credential helper or helper path is written to the workspace or its
+    // git config. Authenticated operations (push/fetch) are run by this
+    // service with a single-use helper that lives outside the workspace.
   }
 
-  private async pushBranch(workspace: Workspace): Promise<void> {
+  private async pushBranch(
+    workspace: Workspace,
+    options: WorkspacePushOptions
+  ): Promise<void> {
     // Push requires credentials
     if (!workspace.credential) {
       throw new Error(
@@ -794,11 +869,12 @@ export class WorkspaceService {
       );
     }
 
-    // Push using origin remote - credentials provided by helper
-    await this.execInDir(
-      workspace.path,
-      `git push -u origin ${workspace.branch.name}`
-    );
+    const args = ['push'];
+    if (options.force) args.push('--force');
+    if (options.setUpstream !== false) args.push('-u');
+    args.push('origin', workspace.branch.name);
+
+    await this.runAuthenticatedInRepo(workspace, workspace.path, args);
   }
 
   private async createPullRequest(
@@ -870,49 +946,165 @@ export class WorkspaceService {
     return null;
   }
 
-  private buildAuthenticatedUrl(repo: string, token: string): string {
-    // Handle various repo formats
-    let url = repo;
+  /**
+   * Run a network git command (fetch/push) inside an existing workspace
+   * repository, authenticating with the workspace's credential.
+   *
+   * Because the repository may have been modified by an agent, when a token is
+   * involved this first refuses to run if the repo's own config could redirect
+   * or capture the credential, and checks that `origin` still points at the
+   * workspace's repository. Hooks and fsmonitor are always disabled for the
+   * command; the credential helper only answers for the repository's host.
+   */
+  private async runAuthenticatedInRepo(
+    workspace: Workspace,
+    cwd: string,
+    args: string[]
+  ): Promise<string> {
+    const repo = parseRepoUrl(workspace.repo);
+    const token = workspace.credential?.token;
 
-    // Convert SSH to HTTPS
-    if (url.startsWith('git@github.com:')) {
-      url = url.replace('git@github.com:', 'https://github.com/');
+    if (!token) {
+      // Public repo or SSH agent auth: nothing secret to protect
+      return this.git(cwd, [...hardeningConfigArgs(), ...args]);
     }
 
-    // Strip trailing slashes before checking for .git
-    url = url.replace(/\/+$/, '');
+    await assertRepoConfigSafe(cwd);
+    await this.assertOriginUrl(cwd, repo.httpsUrl);
 
-    // Add .git if missing
-    if (!url.endsWith('.git')) {
-      url = `${url}.git`;
-    }
-
-    // Ensure HTTPS
-    if (!url.startsWith('https://')) {
-      url = `https://${url}`;
-    }
-
-    // Insert token
-    url = url.replace('https://', `https://x-access-token:${token}@`);
-
-    return url;
+    return this.withCredentialHelper(workspace, repo, token, (authArgs) =>
+      this.git(cwd, [...hardeningConfigArgs(), ...authArgs, ...args], [token])
+    );
   }
 
-  private async execInDir(dir: string, command: string): Promise<string> {
-    // Mask tokens in logs
-    const safeCommand = command.replace(
-      /x-access-token:[^@]+@/g,
-      'x-access-token:***@'
-    );
-    this.log('debug', { dir, command: safeCommand }, 'Executing git command');
+  /**
+   * Check that `origin` (fetch and push URL, after any rewrites) is exactly
+   * the URL the workspace was cloned from.
+   */
+  private async assertOriginUrl(cwd: string, expected: string): Promise<void> {
+    for (const extra of [[], ['--push']]) {
+      const out = await this.git(cwd, [
+        'remote',
+        'get-url',
+        ...extra,
+        'origin',
+      ]);
+      const urls = out
+        .split('\n')
+        .map((u) => u.trim())
+        .filter(Boolean);
+      if (urls.length !== 1 || urls[0] !== expected) {
+        throw new Error(
+          `Refusing to run an authenticated git command: the workspace's origin ${
+            extra.length ? 'push ' : ''
+          }URL (${redactSecrets(urls.join(', '))}) does not match ${expected}`
+        );
+      }
+    }
+  }
 
-    const { stdout, stderr } = await execAsync(command, { cwd: dir });
+  /**
+   * Create a single-use credential helper outside the workspace, run `fn`
+   * with the `-c` arguments that enable it, and always remove it afterwards.
+   */
+  private async withCredentialHelper<T>(
+    workspace: Workspace,
+    repo: ParsedRepoUrl,
+    token: string,
+    fn: (authArgs: string[]) => Promise<T>
+  ): Promise<T> {
+    const helper = await createEphemeralCredentialHelper({
+      token,
+      host: repo.host,
+      parentDir: this.credentialHelperDir,
+    });
+    let helpers = this.activeCredentialHelpers.get(workspace.id);
+    if (!helpers) {
+      helpers = new Set();
+      this.activeCredentialHelpers.set(workspace.id, helpers);
+    }
+    helpers.add(helper);
+    try {
+      return await fn(helper.configArgs);
+    } finally {
+      helpers.delete(helper);
+      if (helpers.size === 0) this.activeCredentialHelpers.delete(workspace.id);
+      try {
+        await helper.dispose();
+      } catch (error) {
+        this.log(
+          'warn',
+          {
+            workspaceId: workspace.id,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'Failed to remove credential helper directory'
+        );
+      }
+    }
+  }
+
+  private async disposeCredentialHelpers(workspaceId: string): Promise<void> {
+    const helpers = this.activeCredentialHelpers.get(workspaceId);
+    if (!helpers) return;
+    this.activeCredentialHelpers.delete(workspaceId);
+    for (const helper of helpers) {
+      try {
+        await helper.dispose();
+      } catch (error) {
+        this.log(
+          'warn',
+          {
+            workspaceId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'Failed to remove credential helper directory'
+        );
+      }
+    }
+  }
+
+  /**
+   * Run a git command with an argument array (no shell). Errors are redacted.
+   */
+  private async git(
+    cwd: string,
+    args: string[],
+    secrets: string[] = []
+  ): Promise<string> {
+    this.log(
+      'debug',
+      { dir: cwd, args: args.map((a) => redactSecrets(a, secrets)) },
+      'Executing git command'
+    );
+
+    const { stdout, stderr } = await runGit(args, { cwd, secrets });
 
     if (stderr && !stderr.includes('Cloning into')) {
-      this.log('debug', { stderr: stderr.substring(0, 200) }, 'Git stderr');
+      this.log(
+        'debug',
+        { stderr: redactSecrets(stderr, secrets).substring(0, 200) },
+        'Git stderr'
+      );
     }
 
     return stdout;
+  }
+
+  /**
+   * Return an Error whose message cannot contain the workspace's token or a
+   * credential-bearing URL.
+   */
+  private sanitizeError(error: unknown, workspace?: Workspace): Error {
+    const secrets = [workspace?.credential?.token];
+    if (error instanceof Error) {
+      const message = redactSecrets(error.message, secrets);
+      if (message === error.message) return error;
+      const safe = new Error(message);
+      safe.name = error.name;
+      return safe;
+    }
+    return new Error(redactSecrets(String(error), secrets));
   }
 
   private log(

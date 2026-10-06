@@ -215,9 +215,9 @@ async function main() {
   await runTest('Push changes to remote', async () => {
     if (!workspace) throw new Error('No workspace');
 
-    await execAsync(`git push -u origin ${workspace.branch.name}`, {
-      cwd: workspace.path,
-    });
+    // Push through the service: workspaces hold no stored credentials, so the
+    // service supplies them for this one command.
+    await workspaceService.push(workspace.id);
   });
 
   // Test 5: Verify push

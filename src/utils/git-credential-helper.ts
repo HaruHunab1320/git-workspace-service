@@ -15,6 +15,15 @@
  * And respond with:
  *   username=x-access-token
  *   password=<token>
+ *
+ * @deprecated Since 0.5.0 `WorkspaceService` no longer uses this module.
+ * `configureCredentialHelper` writes the token and helper script INSIDE the
+ * workspace (`.git-workspace/`) and registers the helper in the workspace's
+ * `.git/config`, so anything running in the workspace (such as a coding
+ * agent) can read the token. The service now supplies credentials per command
+ * through a single-use helper outside the workspace (see `git-exec.ts`).
+ * These exports remain for backwards compatibility only; `cleanupCredentialFiles`
+ * is still used to remove directories left behind by older versions.
  */
 
 import * as fs from 'node:fs';
@@ -35,6 +44,8 @@ export interface CredentialHelperContext {
 
 /**
  * Create the credential helper script content (Node.js version)
+ *
+ * @deprecated Part of the legacy in-workspace credential helper; see the module docs.
  */
 export function createNodeCredentialHelperScript(
   contextFilePath: string
@@ -84,6 +95,8 @@ main();
 
 /**
  * Create a shell-based credential helper script (more portable)
+ *
+ * @deprecated Part of the legacy in-workspace credential helper; see the module docs.
  */
 export function createShellCredentialHelperScript(
   contextFilePath: string
@@ -117,6 +130,8 @@ echo ""
 
 /**
  * Configure git to use the credential helper in a workspace
+ *
+ * @deprecated Part of the legacy in-workspace credential helper; see the module docs.
  */
 export async function configureCredentialHelper(
   workspacePath: string,
@@ -124,7 +139,10 @@ export async function configureCredentialHelper(
 ): Promise<string> {
   // Create the .git-workspace directory in the workspace
   const helperDir = path.join(workspacePath, '.git-workspace');
-  logger.debug({ workspacePath, workspaceId: context.workspaceId }, 'Configuring credential helper');
+  logger.debug(
+    { workspacePath, workspaceId: context.workspaceId },
+    'Configuring credential helper'
+  );
   await fs.promises.mkdir(helperDir, { recursive: true });
 
   // Write the context file
@@ -168,6 +186,8 @@ export async function configureCredentialHelper(
 /**
  * Update credentials for an existing workspace
  * Called when credentials are refreshed
+ *
+ * @deprecated Part of the legacy in-workspace credential helper; see the module docs.
  */
 export async function updateCredentials(
   workspacePath: string,
@@ -215,6 +235,8 @@ export async function cleanupCredentialFiles(
 
 /**
  * Get the git config commands to configure the credential helper
+ *
+ * @deprecated Part of the legacy in-workspace credential helper; see the module docs.
  */
 export function getGitCredentialConfig(helperScriptPath: string): string[] {
   return [
@@ -229,6 +251,8 @@ export function getGitCredentialConfig(helperScriptPath: string): string[] {
 
 /**
  * Output credentials to stdout in Git format
+ *
+ * @deprecated Part of the legacy in-workspace credential helper; see the module docs.
  */
 export function outputCredentials(username: string, password: string): void {
   console.log(`username=${username}`);

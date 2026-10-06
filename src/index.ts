@@ -105,6 +105,7 @@ export {
   isManagedBranch,
   parseBranchName,
 } from './utils/branch-naming';
+// Legacy in-workspace credential helper (deprecated, see module docs)
 export type { CredentialHelperContext } from './utils/git-credential-helper';
 export {
   cleanupCredentialFiles,
@@ -116,6 +117,26 @@ export {
   updateCredentials,
 } from './utils/git-credential-helper';
 export type {
+  EphemeralCredentialHelper,
+  EphemeralCredentialHelperOptions,
+  RunGitOptions,
+  RunGitResult,
+} from './utils/git-exec';
+// Safe git execution & validation
+export {
+  createEphemeralCredentialHelper,
+  GitCommandError,
+  runGit,
+} from './utils/git-exec';
+export type { ParsedRepoUrl } from './utils/git-security';
+export {
+  assertValidRefName,
+  isValidRefName,
+  parseRepoUrl,
+  redactSecrets,
+} from './utils/git-security';
+export type {
+  WorkspacePushOptions,
   WorkspaceServiceLogger,
   WorkspaceServiceOptions,
 } from './workspace-service';
